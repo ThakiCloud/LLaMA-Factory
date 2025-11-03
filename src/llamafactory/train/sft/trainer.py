@@ -17,10 +17,10 @@
 
 import json
 import os
+import time
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
@@ -115,6 +115,89 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
         return super().compute_loss(model, inputs, *args, **kwargs)
+
+    @override
+    def _save_checkpoint(self, model, trial):
+        r"""Override to measure checkpoint saving time."""
+        checkpoint_folder = f"checkpoint-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        
+        logger.info_rank0(f"💾 Starting checkpoint save at step {self.state.global_step}...")
+        start_time = time.time()
+        
+        # Call the parent class's _save_checkpoint method
+        result = super()._save_checkpoint(model, trial)
+        
+        elapsed_time = time.time() - start_time
+        logger.info_rank0(
+            f"✅ Checkpoint saved to {output_dir} in {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)"
+        )
+        
+        return result
+    
+    @override
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        r"""
+        Override to save only LoRA adapter in DeepSpeed ZeRO-3 to avoid CPU OOM.
+        
+        PEFT models always save adapter-only (no need for save_adapter_only parameter).
+        Non-PEFT models use default Trainer behavior.
+        """
+        from peft import PeftModel
+        
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Unwrap model from DDP/FSDP/DeepSpeed wrapper
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        
+        # PEFT models: Always save adapter-only to avoid DeepSpeed full model gather
+        if isinstance(unwrapped_model, PeftModel):
+            logger.info_rank0(f"💡 Detected PEFT model - saving adapter weights only")
+            
+            # Get adapter state dict using DeepSpeed-aware method
+            if self.is_deepspeed_enabled:
+                from peft import get_peft_model_state_dict
+                
+                logger.info_rank0(f"🔧 Using DeepSpeed-aware adapter extraction...")
+                
+                # get_peft_model_state_dict() handles ZeRO-3 gathering internally
+                # CRITICAL: Must call on ALL ranks (uses collective ops)
+                state_dict = get_peft_model_state_dict(
+                    unwrapped_model,
+                    adapter_name="default"
+                )
+                
+                # Barrier ensures all ranks complete gathering
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                
+                # Only main process saves to disk
+                if self.args.should_save:
+                    unwrapped_model.save_pretrained(
+                        output_dir,
+                        state_dict=state_dict,
+                        safe_serialization=self.args.save_safetensors,
+                    )
+                    logger.info_rank0(f"✅ Adapter weights saved (DeepSpeed ZeRO-3 compatible)")
+            else:
+                unwrapped_model.save_pretrained(
+                    output_dir,
+                    safe_serialization=self.args.save_safetensors,
+                )
+                logger.info_rank0(f"✅ Adapter weights saved")
+            
+            # Save tokenizer (only on main process)
+            if self.processing_class is not None and self.args.should_save:
+                self.processing_class.save_pretrained(output_dir)
+            
+            # Note: Optimizer/scheduler/RNG are saved by parent's _save_checkpoint()
+            # based on save_only_model flag
+        else:
+            # Non-PEFT models: Use default Trainer behavior
+            logger.info_rank0(f"Using default save method for non-PEFT model")
+            super().save_model(output_dir, _internal_call)
 
     @override
     def prediction_step(
