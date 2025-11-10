@@ -313,6 +313,10 @@ def use_ray() -> bool:
     return is_env_enabled("USE_RAY")
 
 
+def use_kt() -> bool:
+    return is_env_enabled("USE_KT")
+
+
 def find_available_port() -> int:
     r"""Find an available port on the local machine."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

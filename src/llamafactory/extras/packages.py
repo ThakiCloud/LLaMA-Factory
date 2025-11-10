@@ -82,6 +82,10 @@ def is_ray_available():
     return _is_package_available("ray")
 
 
+def is_kt_available():
+    return _is_package_available("ktransformers")
+
+
 def is_requests_available():
     return _is_package_available("requests")
 
@@ -105,6 +109,11 @@ def is_starlette_available():
 @lru_cache
 def is_transformers_version_greater_than(content: str):
     return _get_package_version("transformers") >= version.parse(content)
+
+
+@lru_cache
+def is_torch_version_greater_than(content: str):
+    return _get_package_version("torch") >= version.parse(content)
 
 
 def is_uvicorn_available():
