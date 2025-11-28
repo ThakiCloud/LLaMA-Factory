@@ -158,29 +158,48 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             
             # Get adapter state dict using DeepSpeed-aware method
             if self.is_deepspeed_enabled:
-                from peft import get_peft_model_state_dict
+                logger.info_rank0(f"🔧 Using DeepSpeed ZeRO-3 manual gather for adapter extraction...")
                 
-                logger.info_rank0(f"🔧 Using DeepSpeed-aware adapter extraction...")
+                # WORKAROUND: get_peft_model_state_dict() doesn't work with ZeRO-3
+                # We need to manually gather parameters from all GPUs
+                import deepspeed
+                from collections import OrderedDict
                 
-                # get_peft_model_state_dict() handles ZeRO-3 gathering internally
-                # CRITICAL: Must call on ALL ranks (uses collective ops)
-                state_dict = get_peft_model_state_dict(
-                    unwrapped_model,
-                    adapter_name="default"
-                )
+                state_dict = OrderedDict()
+                
+                # Get all trainable (LoRA) parameters
+                for name, param in unwrapped_model.named_parameters():
+                    if param.requires_grad and ('lora_' in name.lower() or 'adapter' in name.lower()):
+                        # DeepSpeed ZeRO-3: gather parameter from all GPUs to rank 0
+                        with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
+                            if self.args.should_save:  # Only rank 0 copies data
+                                # Remove 'base_model.model.' prefix if present
+                                clean_name = name
+                                if clean_name.startswith('base_model.model.'):
+                                    clean_name = clean_name[len('base_model.model.'):]
+                                
+                                state_dict[clean_name] = param.data.cpu().clone()
                 
                 # Barrier ensures all ranks complete gathering
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                 
-                # Only main process saves to disk
+                # Validate state_dict
                 if self.args.should_save:
+                    if len(state_dict) == 0:
+                        logger.warning_rank0(f"⚠️  WARNING: state_dict is empty! No LoRA parameters found.")
+                    else:
+                        total_params = sum(p.numel() for p in state_dict.values())
+                        total_size_mb = sum(p.numel() * p.element_size() for p in state_dict.values()) / (1024**2)
+                        logger.info_rank0(f"📊 Gathered {len(state_dict)} LoRA parameters ({total_params:,} total params, {total_size_mb:.2f} MB)")
+                    
+                    # Save using PEFT's save_pretrained with explicit state_dict
                     unwrapped_model.save_pretrained(
                         output_dir,
                         state_dict=state_dict,
                         safe_serialization=self.args.save_safetensors,
                     )
-                    logger.info_rank0(f"✅ Adapter weights saved (DeepSpeed ZeRO-3 compatible)")
+                    logger.info_rank0(f"✅ Adapter weights saved (DeepSpeed ZeRO-3 manual gather)")
             else:
                 unwrapped_model.save_pretrained(
                     output_dir,
