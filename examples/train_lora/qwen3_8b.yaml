@@ -1,0 +1,57 @@
+### model
+model_name_or_path: /data/cache_dir/models/Qwen/Qwen3-8B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+
+### dataset
+dataset: interview_glm_train
+template: qwen3_simple  # System prompt already merged into user in the data
+cutoff_len: 10000
+# max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+enable_thinking: false  # Not applicable to simple Template (removed)
+
+### output
+output_dir: saves/qwen3-8b/lora/sft
+logging_steps: 1
+save_strategy: epoch
+# save_steps: 6
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: wandb  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+optim: adamw_torch
+bf16: true
+gradient_checkpointing: true  # 메모리 절약 (필수!)
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+# ### deepspeed
+# deepspeed: examples/deepspeed/ds_z3_config.json 
+
+## eval
+eval_dataset: interview_glm_eval
+val_size: 0.0
+per_device_eval_batch_size: 1
+eval_strategy: epoch
+# eval_strategy: steps
+# eval_steps: 15  # 몇 step마다 평가할지
