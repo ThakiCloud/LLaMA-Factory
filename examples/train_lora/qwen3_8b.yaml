@@ -13,8 +13,8 @@ lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 
 ### dataset
 dataset: interview_glm_train
-template: qwen3_simple  # System prompt already merged into user in the data
-cutoff_len: 10000
+template: qwen3
+cutoff_len: 21200
 # max_samples: 1000
 overwrite_cache: true
 preprocessing_num_workers: 16
@@ -54,4 +54,4 @@ val_size: 0.0
 per_device_eval_batch_size: 1
 eval_strategy: epoch
 # eval_strategy: steps
-# eval_steps: 15  # 몇 step마다 평가할지
+# eval_steps: 1  # 몇 step마다 평가할지
