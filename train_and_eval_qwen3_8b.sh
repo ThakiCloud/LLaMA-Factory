@@ -4,7 +4,7 @@ set -e  # Exit on error
 
 # Wandb configuration
 WANDB_API_KEY="dc07c5d951fc5c844b15752232fde38909adec05"
-WANDB_RUN_ID="qwen3_8b_interview_600_with_criteria"
+WANDB_RUN_ID="filtered_520"
 
 # Redirect all output to log file (both stdout and stderr)
 LOG_FILE="/data/workspace/kimberly/LLaMA-Factory/${WANDB_RUN_ID}.log"
@@ -141,6 +141,28 @@ for CHECKPOINT_PATH in $CHECKPOINTS; do
         --num_fewshot 0
 
     echo "✅ HAE-RAE evaluation completed for ${CHECKPOINT_NAME}!"
+
+    # Evaluation 4: Interview Eval
+    echo ""
+    echo ">>> Running Interview Eval for ${CHECKPOINT_NAME}..."
+    echo ""
+
+    accelerate launch \
+        --mixed_precision bf16 \
+        --num_processes 4 \
+        --num_machines 1 \
+        --dynamo_backend no \
+        -m lm_eval \
+        --model hf \
+        --model_args "pretrained=/data/cache_dir/models/Qwen/Qwen3-8B,tokenizer=/data/cache_dir/models/Qwen/Qwen3-8B,dtype=bfloat16,peft=${CHECKPOINT_PATH},trust_remote_code=True,think_end_token=</think>" \
+        --tasks interview_eval \
+        --batch_size 16 \
+        --output_path ./results/interview_eval/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
+        --num_fewshot 0 \
+        --log_samples \
+        --apply_chat_template
+
+    echo "✅ Interview Eval completed for ${CHECKPOINT_NAME}!"
     echo ""
 done
 
@@ -168,6 +190,7 @@ echo "$CHECKPOINTS" | while read checkpoint; do
     echo "     - KMMLU: ./results/kmmlu/${WANDB_RUN_ID}-${checkpoint_name}"
     echo "     - KoBEST: ./results/kobest/${WANDB_RUN_ID}-${checkpoint_name}"
     echo "     - HAE-RAE: ./results/haerae/${WANDB_RUN_ID}-${checkpoint_name}"
+    echo "     - Interview Eval: ./results/interview_eval/${WANDB_RUN_ID}-${checkpoint_name}"
 done
 echo ""
 echo "🚀 Done!"
