@@ -4,7 +4,7 @@ set -e  # Exit on error
 
 # Wandb configuration
 WANDB_API_KEY="dc07c5d951fc5c844b15752232fde38909adec05"
-WANDB_RUN_ID="520_filtered_03-batch72_lr1e-4_datav2"
+WANDB_RUN_ID="880_batch72_lr1e-4"
 
 # Redirect all output to log file (both stdout and stderr)
 LOG_FILE="/data/workspace/kimberly/LLaMA-Factory/${WANDB_RUN_ID}.log"
@@ -40,8 +40,8 @@ sed "s|output_dir: saves/qwen3-8b/lora/sft|output_dir: saves/${WANDB_RUN_ID}/lor
     examples/train_lora/qwen3_8b.yaml > ${TEMP_CONFIG}
 
 # Start training
-echo "Starting training with config: ${TEMP_CONFIG}"
-llamafactory-cli train ${TEMP_CONFIG}
+# echo "Starting training with config: ${TEMP_CONFIG}"
+# llamafactory-cli train ${TEMP_CONFIG}
 
 echo ""
 echo "✅ Training completed!"
@@ -51,16 +51,18 @@ echo ""
 rm -f ${TEMP_CONFIG}
 
 # ============================================
-# Step 2: Evaluation with lm-evaluation-harness
+# Step 2: Merge LoRA weights
 # ============================================
 echo ""
-echo ">>> Step 2: Evaluating Qwen3-8B on Korean benchmarks"
+echo ">>> Step 2: Merging LoRA weights into base model"
 echo ""
 
-deactivate && cd /data/workspace/kimberly/lm-evaluation-harness && source venv/bin/activate
-
-# Find all checkpoints (using WANDB_RUN_ID for dynamic path)
+# Configuration
+BASE_MODEL="/data/cache_dir/models/Qwen/Qwen3-8B"
 CHECKPOINT_DIR="/data/workspace/kimberly/LLaMA-Factory/saves/${WANDB_RUN_ID}/lora/sft"
+MERGED_MODEL_DIR="/data/cache_dir/models/Qwen/Qwen3-8B-merged/${WANDB_RUN_ID}"
+
+# Find all checkpoints
 CHECKPOINTS=$(ls -d ${CHECKPOINT_DIR}/checkpoint-* 2>/dev/null | sort -V)
 
 if [ -z "$CHECKPOINTS" ]; then
@@ -74,98 +76,189 @@ echo "$CHECKPOINTS" | while read checkpoint; do
 done
 echo ""
 
-# Evaluate each checkpoint
+# Merge each checkpoint
 for CHECKPOINT_PATH in $CHECKPOINTS; do
     CHECKPOINT_NAME=$(basename $CHECKPOINT_PATH)
+    MERGED_OUTPUT="${MERGED_MODEL_DIR}/${CHECKPOINT_NAME}"
+    
     echo ""
     echo "=========================================="
-    echo "Evaluating ${CHECKPOINT_NAME}"
+    echo "Merging ${CHECKPOINT_NAME}"
     echo "=========================================="
     echo ""
+    
+    python /data/workspace/kimberly/LLaMA-Factory/scripts/merge_lora.py \
+        --base_model ${BASE_MODEL} \
+        --lora_path ${CHECKPOINT_PATH} \
+        --output_path ${MERGED_OUTPUT} \
+        --dtype bfloat16 \
+        --device_map auto
+    
+    echo "✅ Merged ${CHECKPOINT_NAME} to ${MERGED_OUTPUT}"
+done
 
-    # Evaluation 1: KMMLU
+echo ""
+echo "✅ All checkpoints merged!"
+echo ""
+
+# ============================================
+# Step 3: Evaluation with lm-evaluation-harness
+# ============================================
+echo ""
+echo ">>> Step 3: Evaluating merged models on Korean benchmarks"
+echo ""
+
+deactivate && cd /data/workspace/kimberly/lm-evaluation-harness && source venv/bin/activate
+
+# Create results directories
+mkdir -p ./results/kmmlu ./results/kobest ./results/haerae ./results/interview_eval
+
+# # Evaluate each merged checkpoint (KMMLU, KoBEST, HAE-RAE - sequential)
+# for CHECKPOINT_PATH in $CHECKPOINTS; do
+#     CHECKPOINT_NAME=$(basename $CHECKPOINT_PATH)
+#     MERGED_MODEL_PATH="${MERGED_MODEL_DIR}/${CHECKPOINT_NAME}"
+#     
+#     echo ""
+#     echo "=========================================="
+#     echo "Evaluating ${CHECKPOINT_NAME} (merged)"
+#     echo "=========================================="
+#     echo ""
+# 
+#     # Evaluation 1: KMMLU
+#     echo ""
+#     echo ">>> Running KMMLU evaluation for ${CHECKPOINT_NAME}..."
+#     echo ""
+# 
+#     accelerate launch \
+#         --mixed_precision bf16 \
+#         --num_processes 4 \
+#         --num_machines 1 \
+#         --dynamo_backend no \
+#         -m lm_eval \
+#         --model hf \
+#         --model_args pretrained=${MERGED_MODEL_PATH},dtype=bfloat16,trust_remote_code=True \
+#         --tasks kmmlu \
+#         --batch_size 500 \
+#         --output_path ./results/kmmlu/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
+#         --num_fewshot 0
+# 
+#     echo "✅ KMMLU evaluation completed for ${CHECKPOINT_NAME}!"
+# 
+#     # Evaluation 2: KoBEST
+#     echo ""
+#     echo ">>> Running KoBEST evaluation for ${CHECKPOINT_NAME}..."
+#     echo ""
+# 
+#     accelerate launch \
+#         --mixed_precision bf16 \
+#         --num_processes 4 \
+#         --num_machines 1 \
+#         --dynamo_backend no \
+#         -m lm_eval \
+#         --model hf \
+#         --model_args pretrained=${MERGED_MODEL_PATH},dtype=bfloat16,trust_remote_code=True \
+#         --tasks kobest \
+#         --batch_size 800 \
+#         --output_path ./results/kobest/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
+#         --num_fewshot 0
+# 
+#     echo "✅ KoBEST evaluation completed for ${CHECKPOINT_NAME}!"
+# 
+#     # Evaluation 3: HAE-RAE
+#     echo ""
+#     echo ">>> Running HAE-RAE evaluation for ${CHECKPOINT_NAME}..."
+#     echo ""
+# 
+#     accelerate launch \
+#         --mixed_precision bf16 \
+#         --num_processes 4 \
+#         --num_machines 1 \
+#         --dynamo_backend no \
+#         -m lm_eval \
+#         --model hf \
+#         --model_args pretrained=${MERGED_MODEL_PATH},dtype=bfloat16,trust_remote_code=True \
+#         --tasks haerae \
+#         --batch_size 400 \
+#         --output_path ./results/haerae/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
+#         --num_fewshot 0
+# 
+#     echo "✅ HAE-RAE evaluation completed for ${CHECKPOINT_NAME}!"
+#     echo ""
+# done
+
+# ============================================
+# Step 4: Interview Eval with vLLM (Parallel on 3 GPUs)
+# ============================================
+echo ""
+echo ">>> Step 4: Running Interview Eval with vLLM (parallel on GPU 0, 1, 2)"
+echo ""
+
+# Convert checkpoints to array
+CHECKPOINT_ARRAY=($CHECKPOINTS)
+PIDS=()
+
+# Launch interview eval for each checkpoint on different GPUs
+for i in "${!CHECKPOINT_ARRAY[@]}"; do
+    if [ $i -ge 3 ]; then
+        echo "⚠️ More than 3 checkpoints found. Only first 3 will run in parallel."
+        break
+    fi
+    
+    CHECKPOINT_PATH="${CHECKPOINT_ARRAY[$i]}"
+    CHECKPOINT_NAME=$(basename $CHECKPOINT_PATH)
+    MERGED_MODEL_PATH="${MERGED_MODEL_DIR}/${CHECKPOINT_NAME}"
+    GPU_ID=$i
+    
     echo ""
-    echo ">>> Running KMMLU evaluation for ${CHECKPOINT_NAME}..."
+    echo ">>> Launching Interview Eval for ${CHECKPOINT_NAME} on GPU ${GPU_ID}..."
     echo ""
-
-    accelerate launch \
-        --mixed_precision bf16 \
-        --num_processes 4 \
-        --num_machines 1 \
-        --dynamo_backend no \
-        -m lm_eval \
-        --model hf \
-        --model_args pretrained=/data/cache_dir/models/Qwen/Qwen3-8B,tokenizer=/data/cache_dir/models/Qwen/Qwen3-8B,dtype=bfloat16,peft=${CHECKPOINT_PATH},trust_remote_code=True \
-        --tasks kmmlu \
-        --batch_size 500 \
-        --output_path ./results/kmmlu/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
-        --num_fewshot 0
-
-    echo "✅ KMMLU evaluation completed for ${CHECKPOINT_NAME}!"
-
-    # Evaluation 2: KoBEST
-    echo ""
-    echo ">>> Running KoBEST evaluation for ${CHECKPOINT_NAME}..."
-    echo ""
-
-    accelerate launch \
-        --mixed_precision bf16 \
-        --num_processes 4 \
-        --num_machines 1 \
-        --dynamo_backend no \
-        -m lm_eval \
-        --model hf \
-        --model_args pretrained=/data/cache_dir/models/Qwen/Qwen3-8B,tokenizer=/data/cache_dir/models/Qwen/Qwen3-8B,dtype=bfloat16,peft=${CHECKPOINT_PATH},trust_remote_code=True \
-        --tasks kobest \
-        --batch_size 800 \
-        --output_path ./results/kobest/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
-        --num_fewshot 0
-
-    echo "✅ KoBEST evaluation completed for ${CHECKPOINT_NAME}!"
-
-    # Evaluation 3: HAE-RAE
-    echo ""
-    echo ">>> Running HAE-RAE evaluation for ${CHECKPOINT_NAME}..."
-    echo ""
-
-    accelerate launch \
-        --mixed_precision bf16 \
-        --num_processes 4 \
-        --num_machines 1 \
-        --dynamo_backend no \
-        -m lm_eval \
-        --model hf \
-        --model_args pretrained=/data/cache_dir/models/Qwen/Qwen3-8B,tokenizer=/data/cache_dir/models/Qwen/Qwen3-8B,dtype=bfloat16,peft=${CHECKPOINT_PATH},trust_remote_code=True \
-        --tasks haerae \
-        --batch_size 400 \
-        --output_path ./results/haerae/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
-        --num_fewshot 0
-
-    echo "✅ HAE-RAE evaluation completed for ${CHECKPOINT_NAME}!"
-
-    # Evaluation 4: Interview Eval
-    echo ""
-    echo ">>> Running Interview Eval for ${CHECKPOINT_NAME}..."
-    echo ""
-
-    accelerate launch \
-        --mixed_precision bf16 \
-        --num_processes 4 \
-        --num_machines 1 \
-        --dynamo_backend no \
-        -m lm_eval \
-        --model hf \
-        --model_args "pretrained=/data/cache_dir/models/Qwen/Qwen3-8B,tokenizer=/data/cache_dir/models/Qwen/Qwen3-8B,dtype=bfloat16,peft=${CHECKPOINT_PATH},trust_remote_code=True,think_end_token=</think>" \
+    
+    CUDA_VISIBLE_DEVICES=${GPU_ID} python -m lm_eval \
+        --model vllm \
+        --model_args "pretrained=${MERGED_MODEL_PATH},dtype=bfloat16,tensor_parallel_size=1,gpu_memory_utilization=0.9,max_model_len=32768,trust_remote_code=True,think_end_token=</think>" \
         --tasks interview_eval \
         --batch_size 16 \
         --output_path ./results/interview_eval/${WANDB_RUN_ID}-${CHECKPOINT_NAME} \
         --num_fewshot 0 \
         --log_samples \
-        --apply_chat_template
-
-    echo "✅ Interview Eval completed for ${CHECKPOINT_NAME}!"
-    echo ""
+        --apply_chat_template \
+        > ./results/interview_eval/${WANDB_RUN_ID}-${CHECKPOINT_NAME}.log 2>&1 &
+    
+    PIDS+=($!)
+    echo "  Started PID ${PIDS[-1]} for ${CHECKPOINT_NAME} on GPU ${GPU_ID}"
 done
+
+echo ""
+echo "⏳ Waiting for all Interview Eval jobs to complete..."
+echo "   PIDs: ${PIDS[*]}"
+echo ""
+
+# Wait for all background jobs and check exit status
+FAILED=0
+for i in "${!PIDS[@]}"; do
+    PID=${PIDS[$i]}
+    CHECKPOINT_NAME=$(basename ${CHECKPOINT_ARRAY[$i]})
+    
+    wait $PID
+    EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "✅ Interview Eval completed for ${CHECKPOINT_NAME} (PID: $PID)"
+    else
+        echo "❌ Interview Eval FAILED for ${CHECKPOINT_NAME} (PID: $PID, Exit: $EXIT_CODE)"
+        echo "   Check log: ./results/interview_eval/${WANDB_RUN_ID}-${CHECKPOINT_NAME}.log"
+        FAILED=1
+    fi
+done
+
+if [ $FAILED -eq 1 ]; then
+    echo ""
+    echo "⚠️ Some Interview Eval jobs failed. Check logs for details."
+fi
+
+echo ""
+echo "✅ All Interview Eval jobs completed!"
+echo ""
 
 echo ""
 echo "=========================================="
@@ -184,9 +277,15 @@ echo ""
 echo "📊 Results:"
 echo "  - Full execution log: ${LOG_FILE}"
 echo ""
+echo "📁 Merged models:"
+for CHECKPOINT_PATH in $CHECKPOINTS; do
+    checkpoint_name=$(basename $CHECKPOINT_PATH)
+    echo "  📦 ${MERGED_MODEL_DIR}/${checkpoint_name}"
+done
+echo ""
 echo "📁 Evaluation results by checkpoint:"
-echo "$CHECKPOINTS" | while read checkpoint; do
-    checkpoint_name=$(basename $checkpoint)
+for CHECKPOINT_PATH in $CHECKPOINTS; do
+    checkpoint_name=$(basename $CHECKPOINT_PATH)
     echo "  📌 ${checkpoint_name}:"
     echo "     - KMMLU: ./results/kmmlu/${WANDB_RUN_ID}-${checkpoint_name}"
     echo "     - KoBEST: ./results/kobest/${WANDB_RUN_ID}-${checkpoint_name}"
