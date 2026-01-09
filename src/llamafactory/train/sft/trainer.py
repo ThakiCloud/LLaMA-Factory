@@ -21,6 +21,7 @@ import time
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
@@ -139,83 +140,99 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     @override
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         r"""
-        Override to save only LoRA adapter in DeepSpeed ZeRO-3 to avoid CPU OOM.
+        Override to save LoRA adapter with DeepSpeed ZeRO-3 compatibility.
         
-        PEFT models always save adapter-only (no need for save_adapter_only parameter).
-        Non-PEFT models use default Trainer behavior.
+        Uses direct torch.distributed.all_gather on ds_tensor to avoid
+        GatheredParameters INFLIGHT issues with MoE models after evaluation.
         """
         from peft import PeftModel
+        from collections import OrderedDict
         
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         
-        # Unwrap model from DDP/FSDP/DeepSpeed wrapper
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         
-        # PEFT models: Always save adapter-only to avoid DeepSpeed full model gather
-        if isinstance(unwrapped_model, PeftModel):
-            logger.info_rank0(f"💡 Detected PEFT model - saving adapter weights only")
+        if isinstance(unwrapped_model, PeftModel) and self.is_deepspeed_enabled:
+            logger.info_rank0(f"💡 Saving PEFT adapter with DeepSpeed ZeRO-3 (direct all_gather)...")
             
-            # Get adapter state dict using DeepSpeed-aware method
-            if self.is_deepspeed_enabled:
-                logger.info_rank0(f"🔧 Using DeepSpeed ZeRO-3 manual gather for adapter extraction...")
-                
-                # WORKAROUND: get_peft_model_state_dict() doesn't work with ZeRO-3
-                # We need to manually gather parameters from all GPUs
-                import deepspeed
-                from collections import OrderedDict
-                
-                state_dict = OrderedDict()
-                
-                # Get all trainable (LoRA) parameters
-                for name, param in unwrapped_model.named_parameters():
-                    if param.requires_grad and ('lora_' in name.lower() or 'adapter' in name.lower()):
-                        # DeepSpeed ZeRO-3: gather parameter from all GPUs to rank 0
-                        with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
-                            if self.args.should_save:  # Only rank 0 copies data
-                                # Remove 'base_model.model.' prefix if present
-                                clean_name = name
-                                if clean_name.startswith('base_model.model.'):
-                                    clean_name = clean_name[len('base_model.model.'):]
-                                
-                                state_dict[clean_name] = param.data.cpu().clone()
-                
-                # Barrier ensures all ranks complete gathering
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
-                
-                # Validate state_dict
-                if self.args.should_save:
-                    if len(state_dict) == 0:
-                        logger.warning_rank0(f"⚠️  WARNING: state_dict is empty! No LoRA parameters found.")
-                    else:
-                        total_params = sum(p.numel() for p in state_dict.values())
-                        total_size_mb = sum(p.numel() * p.element_size() for p in state_dict.values()) / (1024**2)
-                        logger.info_rank0(f"📊 Gathered {len(state_dict)} LoRA parameters ({total_params:,} total params, {total_size_mb:.2f} MB)")
+            # Collect LoRA params
+            lora_params = [(name, param) for name, param in unwrapped_model.named_parameters()
+                          if param.requires_grad and 'lora' in name.lower()]
+            logger.info_rank0(f"📊 Found {len(lora_params)} LoRA params")
+            
+            # Sync all ranks before gathering
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            torch.cuda.synchronize()
+            
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            
+            state_dict = OrderedDict()
+            
+            for name, param in lora_params:
+                if hasattr(param, 'ds_tensor'):
+                    # ZeRO-3: param is partitioned, gather from all ranks
+                    local_tensor = param.ds_tensor.to(param.device)
                     
-                    # Save using PEFT's save_pretrained with explicit state_dict
-                    unwrapped_model.save_pretrained(
-                        output_dir,
-                        state_dict=state_dict,
-                        safe_serialization=self.args.save_safetensors,
-                    )
-                    logger.info_rank0(f"✅ Adapter weights saved (DeepSpeed ZeRO-3 manual gather)")
-            else:
+                    # Create list of tensors to gather into
+                    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_tensors, local_tensor)
+                    
+                    # Concatenate all shards to get full tensor
+                    full_tensor = torch.cat(gathered_tensors, dim=0)
+                    
+                    # Reshape to original shape
+                    full_tensor = full_tensor[:param.ds_numel].view(param.ds_shape)
+                    
+                    if self.args.should_save:
+                        state_dict[name] = full_tensor.detach().cpu().clone()
+                else:
+                    # Not partitioned
+                    if self.args.should_save:
+                        state_dict[name] = param.detach().cpu().clone()
+            
+            logger.info_rank0(f"📊 Gathered {len(state_dict)} params successfully!")
+            
+            # Verify values - check for all-zeros
+            if self.args.should_save:
+                lora_a_zeros = sum(1 for n, t in state_dict.items() if 'lora_A' in n and (t == 0).all())
+                lora_b_zeros = sum(1 for n, t in state_dict.items() if 'lora_B' in n and (t == 0).all())
+                lora_a_total = sum(1 for n in state_dict if 'lora_A' in n)
+                lora_b_total = sum(1 for n in state_dict if 'lora_B' in n)
+                logger.info_rank0(f"   lora_A: {lora_a_total} params, {lora_a_zeros} all-zeros")
+                logger.info_rank0(f"   lora_B: {lora_b_total} params, {lora_b_zeros} all-zeros")
+                
+                if lora_b_zeros == lora_b_total and lora_b_total > 0:
+                    logger.info_rank0(f"⚠️ WARNING: All lora_B weights are zero! Check if learning_rate > 0")
+                
                 unwrapped_model.save_pretrained(
                     output_dir,
+                    state_dict=state_dict,
                     safe_serialization=self.args.save_safetensors,
                 )
-                logger.info_rank0(f"✅ Adapter weights saved")
+                logger.info_rank0(f"✅ Adapter saved!")
             
-            # Save tokenizer (only on main process)
+            # Sync all ranks
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            
             if self.processing_class is not None and self.args.should_save:
                 self.processing_class.save_pretrained(output_dir)
-            
-            # Note: Optimizer/scheduler/RNG are saved by parent's _save_checkpoint()
-            # based on save_only_model flag
+        
+        elif isinstance(unwrapped_model, PeftModel):
+            # Non-DeepSpeed PEFT save
+            unwrapped_model.save_pretrained(
+                output_dir,
+                safe_serialization=self.args.save_safetensors,
+            )
+            if self.processing_class is not None and self.args.should_save:
+                self.processing_class.save_pretrained(output_dir)
+            logger.info_rank0(f"✅ Adapter saved!")
+        
         else:
-            # Non-PEFT models: Use default Trainer behavior
-            logger.info_rank0(f"Using default save method for non-PEFT model")
+            # Non-PEFT models
             super().save_model(output_dir, _internal_call)
 
     @override
